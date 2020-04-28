@@ -1,0 +1,1135 @@
+#!/bin/bash -e
+
+declare -A VRFS
+VRFS=(
+[pub-a]=192.168.168.0/24
+[pub-b]=192.168.169.0/24
+[pub-c]=192.168.170.0/24
+[pub-d]=192.168.100.0/24
+)
+declare -A VRFSGW
+VRFSGW=(
+[pub-a]=192.168.168.1
+[pub-b]=192.168.169.1
+[pub-c]=192.168.170.1
+[pub-d]=192.168.100.1
+)
+declare -A RDVRFS
+RDVRFS=(
+[192.168.168.0:24]=pub-a
+[192.168.169.0:24]=pub-b
+[192.168.170.0:24]=pub-c
+[192.168.100.0:24]=pub-d
+)
+declare -A VRFSRD
+for k in "${!RDVRFS[@]}"; do
+VRFSRD[${RDVRFS[$k]}]=$k
+done
+
+VRVSRD=
+VRF_TABLES_BASE=15
+VRF_TABLES_MAX=65536
+VRF_TABLES_FILE=/etc/iproute2/rt_tables.d/pub.conf
+
+DATAPLANE_LWTUNNEL=yes # use encap routes instead tunnel devs
+if [ -f /root/nolwtun ]; then
+DATAPLANE_LWTUNNEL=
+fi
+DATAPLANE_UDP=yes
+if [ -f /root/noudp ]; then
+DATAPLANE_UDP=
+fi
+
+DATAPLANE_ROUTE_UDP_METRIC=100
+DATAPLANE_ROUTE_GRE_METRIC=101
+
+BGP_PEER_IP=172.31.0.16
+BGP_PEER_IP=172.31.0.29
+if [ -f /root/bgpneigh ]; then
+  BGP_PEER_IP="$(echo `cat /root/bgpneigh`)"
+fi
+GOBGPD_CONF_TEMPLATE='
+global:
+    config:
+        router-id: $MY_IP
+        as: 65012
+peer-groups:
+    - config:
+        peer-group-name: cloud
+        peer-as: 64512
+      afi-safis:
+        - config:
+            afi-safi-name: l3vpn-ipv4-unicast
+        - config:
+            afi-safi-name: l2vpn-evpn
+        - config:
+            afi-safi-name: rtc
+      transport:
+        config:
+            local-address: $MY_IP
+      timers:
+        config:
+          hold-time: 30
+          keepalive-interval: 10
+          connect-retry: 5
+neighbors:
+    - config:
+        neighbor-address: $BGP_PEER_IP
+        peer-group: cloud
+'
+
+GOBGPD_SERVICE="
+[Unit]
+Description='GoBGP daemon'
+ConditionPathExists=/etc/gobgp/gobgpd.conf
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gobgpd -t yaml -f /etc/gobgp/gobgpd.conf
+"
+
+SGW_SERVICE="
+[Unit]
+Description='SGW route monitor'
+
+[Service]
+Type=exec
+ExecStartPre=/usr/local/bin/sgw --init
+ExecStart=/usr/local/bin/sgw -m
+"
+
+SYSCTL_FILE=/etc/sysctl.d/12-sgw.conf
+SYSCTL="
+net.ipv4.ip_forward=1
+net.mpls.platform_labels=1048575
+net.ipv4.tcp_l3mdev_accept=1
+net.ipv4.udp_l3mdev_accept=1
+"
+
+SYSCTL_TUN_TEMPLATE='
+net.mpls.conf.${name}.input=1
+net.ipv4.conf.${name}.rp_filter=2
+'
+TUNNEL_PROC_SETTINGS='
+1 /proc/sys/net/mpls/conf/${name}/input
+2 /proc/sys/net/ipv4/conf/${name}/rp_filter
+'
+
+MODULES_FILE=/etc/modules-load.d/mpls.conf
+MODULES="
+mpls_router
+mpls_iptunnel
+fou
+"
+
+
+msg(){
+  echo "$@" >&2
+}
+
+verbose(){
+ if [ -n "$verbose" ]; then
+   msg "$@"
+ fi
+}
+
+debug(){
+ if [ -n "$debug" ]; then
+   msg "$@"
+ fi
+}
+
+warning(){
+  msg "$@"
+}
+
+error(){
+  local code="$1"
+  local msg="$2"
+  msg "ERROR:$code $msg"
+  return $code
+}
+
+fail(){
+  local code="$1"
+  local msg="$2"
+  msg "ERROR:$code $msg. Exiting"
+  exit $code
+}
+
+cmd(){
+ local out err
+ verbose "$@"
+ if [ -z "$dryrun" ]; then
+   if out="$($@)"; then
+     if [ -n "$out" ]; then
+       echo "$out"
+     fi
+   else
+     R=$?
+     debug "$R $out"
+     return $R
+   fi
+ fi
+}
+
+function is_not_uniq(){
+  local a=$(echo "$1"|grep -v "^$"|sort|wc -l)
+  local b=$(echo "$1"|grep -v "^$"|sort -u|wc -l)
+  if [ $a -eq $b ]; then
+    return 1
+  fi
+}
+
+function find_gap_in_set(){
+  local ids="$1"
+  local min="$2"
+  local max="$3"
+  local p="$min"
+  ids="$(echo $ids|tr ' ' '\n'|sort -u|awk -v p=$p '{if($1>p)print}')" #" remove all that less then min+1
+  ids="$ids $max"
+  for id in $ids; do
+    nid=$((p+1))
+    if [ $id -ne $nid ]; then
+      echo "$nid"
+      break
+    fi
+    p=$id
+  done
+}
+
+function tables_with_routes() {
+  ip -j -d route show table all |jq -r '[.[].table]|unique|@tsv'
+}
+
+function check_create_tables_file_pub() {
+  if [ ! -f "$VRF_TABLES_FILE" ]; then
+    mkdir -p "$(dirname "$VRF_TABLES_FILE")"
+    touch "$VRF_TABLES_FILE"
+  fi
+}
+
+function tableList() {
+  check_create_tables_file_pub
+  cat "$VRF_TABLES_FILE"
+}
+
+function tableGet() {
+  local name="$1"
+  local tl id
+  if ! tl="$(tableList)"; then
+    debug "failed get table list"
+    return 1
+  fi
+  if id="$(echo "$tl"|awk -v name="$name" '$2==name{print $1}')" && [ -n "$id" ]; then
+    echo "$id"
+  else
+    return 1
+  fi
+}
+
+function tableCreate() {
+  local name="$1"
+  local ids id
+  local tl newtl
+  if ! tl="$(tableList)"; then
+    debug "failed get table list"
+    return 1
+  fi
+  if ! ids=$(echo "$tl"|awk '{print $1}'|sort -u); then
+    return 2
+  fi
+
+  id="$(find_gap_in_set "$ids" "$VRF_TABLES_BASE" "$VRF_TABLES_MAX")"
+  debug "newid: $id"
+  newtl=`(echo "$id $name"; echo "$tl")|grep -v "^$"|sort -k1`
+  debug "newtl: $newtl"
+  if is_not_uniq "$newtl"; then
+    fail 3 "fixme: duplicate record"
+  fi
+  if is_not_uniq "$(echo "$newtl"|awk '{print $1}')"; then
+    fail 4 "fixme: duplicate table id"
+  fi
+  if is_not_uniq "$(echo "$newtl"|awk '{print $2}')"; then
+    fail 5 "fixme: duplicate table name"
+  fi
+  echo "$newtl" > "$VRF_TABLES_FILE"
+  echo "$id"
+}
+
+function tableDelete() {
+  local name="$1"
+  local tl newtl
+  if ! tl="$(tableList)"; then
+    debug "failed get table list"
+    return 1
+  fi
+  newtl="$(echo "$tl"|awk -v name="$name" '$2!=name{print}')"
+  echo "$newtl" > "$VRF_TABLES_FILE"
+}
+
+function vrfListDataplane() {
+  local vrfs
+  if ! vrfs="$(ip -j -d addr show type vrf)"; then
+    debug "failed to get vrfs"
+    return 1
+  fi
+  if ! vrfs="$(echo "$vrfs"|jq -r 'del(.[]|select(. == {}))|.[]|[.ifname, .operstate, .ifindex, .linkinfo.info_data.table, .addr_info[].local]|@tsv')"; then
+    debug "failed to parse vrfs"
+    return 2
+  fi
+  echo "$vrfs"
+}
+
+function vrfGetDataplane() {
+  local name="$1"
+  local vrf
+  if ! vrf="$(ip -j -d addr show type vrf dev $name)"; then
+    debug "vrf does not exist yet: $name"
+    return 1
+  fi
+  if ! vrf="$(echo "$vrf"|jq -r 'del(.[]|select(. == {}))|.[]|[.ifname, .operstate, .ifindex, .linkinfo.info_data.table, .addr_info[].local]|@tsv')"; then
+    error 2 "failed to parse vrf: $name"
+  fi
+  echo "$vrf"
+}
+
+function vrfCreateDataplane {
+  local name="$1"
+  local cidr gw
+  if ! cidr="${VRFS[$name]}" || [ -z "$cidr" ]; then
+    error 1 "failed to get cidr for vrf $name"
+  fi
+  if ! gw="${VRFSGW[$name]}" || [ -z "$gw" ]; then
+    error 2 "failed to get gw for vrf $name"
+  fi
+  if vrf="$(vrfGetDataplane $name)"; then
+    debug "vrf named $vrf already exists"
+  else
+    if ! table="$(tableGet "$name")"; then
+      if ! table="$(tableCreate "$name")"; then
+        fail 3 "failed to create table"
+      fi
+    fi
+    cmd ip link add $name type vrf table $table
+    cmd ip link set $name up
+  fi
+
+  if ! R="$(ip -o r s dev $name table $name|awk '/^local/{print $2}'|head -1)" || [ -z "$R" ]; then
+    cmd ip addr add $gw/32 dev $name
+    cmd ip addr add $gw/32 dev lo
+  fi
+  if ! R="$(ip route show type unreachable $cidr vrf $name)" || [ -z "$R" ]; then
+    cmd ip route add unreachable $cidr vrf $name
+  fi
+  if ! R="$(ip rule show to $cidr table $name)" || [ -z "$R" ]; then
+    cmd ip rule add to $cidr table $name
+  fi
+  if ! R="$(ip -M route show $table)" || [ -z "$R" ]; then
+    cmd ip -M route add $table dev lo
+  fi
+}
+
+function vrfDeleteDataplane() {
+  local name="$1"
+  local cidr gw
+
+  if ! cidr="${VRFS[$name]}" || [ -z "$cidr" ]; then
+    error 1 "failed to get cidr for vrf $name"
+  fi
+  if ! gw="${VRFSGW[$name]}" || [ -z "$gw" ]; then
+    error 2 "failed to get gw for vrf $name"
+  fi
+
+  if vrf="$(vrfGetDataplane $name)"; then
+    debug "deleting vrf named $name"
+    cmd ip link del $name
+    if table="$(tableGet "$name")"; then
+      cmd ip rule del to $cidr table $table
+      cmd ip route flush table $table
+      if ! tableDelete "$name"; then
+        error 3 "failed to delete table $table"
+      fi
+      if R="$(ip -M route show $table)" && [ -n "$R" ]; then
+        cmd ip -M route del $table
+      fi
+    fi
+    cmd ip addr delete $gw/32 dev lo ||:
+  else
+    error 4 "vrf named $name does not exist"
+  fi
+}
+
+function vrfCreateControlplane() {
+  local name="$1"
+  local id
+  local cidr gw
+  if ! cidr="${VRFS[$name]}" || [ -z "$cidr" ]; then
+    error 1 "failed to get cidr for vrf $name"
+  fi
+  if ! gw="${VRFSGW[$name]}" || [ -z "$gw" ]; then
+    error 2 "failed to get gw for vrf $name"
+  fi
+
+  if dpvrf=$(vrfGetDataplane "$name"); then
+    dev_id="$(echo $dpvrf|awk '{print $3}')"
+    table_id="$(echo $dpvrf|awk '{print $4}')"
+  else
+    warning "failed to get table id for $name. Hint: create vrf $name for dataplane first."
+    return
+  fi
+  rd="$MY_IP:$table_id"
+  rt="${VRFSRD[$name]}"
+  rte="$(echo $rt|awk -F: '{print $1":"$2$2}')"
+  cmd gobgp vrf add "$name" id "$dev_id" rd "$rd" rt import "$rt" export "$rte"
+  cmd gobgp global rib add -a vpnv4 $gw/32 label $table_id rd "$rd" rt "$rte" nexthop 0.0.0.0 encap gre ${DATAPLANE_UDP:+encap mpls-in-udp} #router-mac fa:16:3e:a4:db:ad
+  cmd gobgp global rib add -a vpnv4 0.0.0.0/0 label $table_id rd "$rd" rt "$rte" nexthop 0.0.0.0 encap gre ${DATAPLANE_UDP:+encap mpls-in-udp} #router-mac fa:16:3e:a4:db:ad
+}
+
+function vrfListControlplane() {
+  gobgp vrf|awk '$2!="RD"{print}'
+}
+
+function vrfGetControlplane() {
+  local name="$1"
+  gobgp vrf|awk -v name="$name" '$1==name{print}'
+}
+
+function vrfDeleteControlplane() {
+  local name="$1"
+  if ! vrf="$(vrfGetControlplane "$name")"; then
+    error 1 "vrf named $name does not exist"
+  fi
+  cmd gobgp vrf del $name
+}
+
+function vrfList() {
+  local filter="${1:-both}" # controlplane dataplane or both
+  case "$filter" in
+    "controlplane")
+      vrfListControlplane
+      ;;
+    "dataplane")
+      vrfListDataplane
+      ;;
+    "both")
+      vrfListControlplane
+      vrfListDataplane
+      ;;
+    *)
+      error 1 "filter is controlplane dataplane or both, but got $filter"
+      ;;
+  esac
+}
+
+function vrfGet() {
+  local name="$1"
+  local filter="${2:-both}" # controlplane dataplane or both
+  case "$filter" in
+    "controlplane")
+      vrfGetControlplane "$name"
+      ;;
+    "dataplane")
+      vrfGetDataplane "$name"
+      ;;
+    "both")
+      vrfGetControlplane "$name"
+      vrfGetDataplane "$name"
+      ;;
+    *)
+      error 1 "filter is controlplane dataplane or both, but got $filter"
+      ;;
+  esac
+}
+
+function vrfCreate() {
+  local name="$1"
+  local filter="${2:-both}" # controlplane dataplane or both
+  case "$filter" in
+    "dataplane")
+      vrfCreateDataplane "$name"
+      ;;
+    "controlplane")
+      vrfCreateControlplane "$name"
+      ;;
+    "both")
+      vrfCreateDataplane "$name"
+      vrfCreateControlplane "$name"
+      ;;
+    *)
+      error 2 "filter is controlplane dataplane or both, but got $filter"
+      ;;
+  esac
+}
+
+function vrfDelete() {
+  local name="$1"
+  local filter="${2:-both}" # controlplane dataplane or both
+  case "$filter" in
+    "controlplane")
+      vrfDeleteControlplane "$name"
+      ;;
+    "dataplane")
+      vrfDeleteDataplane "$name"
+      ;;
+    "both") # both mean any here :)
+      R="$(vrfDeleteControlplane "$name" && echo ok;
+           vrfDeleteDataplane    "$name" && echo ok)"
+      if [ -z "$R" ]; then
+        error 2 "not controlplane nor dataplane vrf for $name was sucessfully deleted"
+      fi
+      ;;
+    *)
+      error 1 "filter is controlplane dataplane or both, but got $filter"
+      ;;
+  esac
+}
+
+function routeListDataplane() {
+  if [ -n "$DATAPLANE_LWTUNNEL" ]; then
+    ip -o route show table all proto bgp dev gre|
+      while read prefix e i id label s src d dst t ttl to tos t table o; do
+          echo $prefix $label $dst $table gre
+      done
+    if [ -n "$DATAPLANE_UDP" ]; then
+      ip -o route show table all proto bgp dev udp|
+        while read prefix e i id label s src d dst t ttl to tos t table o; do
+            echo $prefix $label $dst $table udp
+        done
+    fi
+  else
+    ip r s t all proto bgp|
+      while read ip encap mpls label dev dev table t src s metric m o; do
+        encap="${dev%%-*}"
+        dst="${dev##*-}"
+        if [ -n "$dst" ]; then
+          echo $ip $label $dst $t $encap
+        fi
+      done
+  fi
+}
+function ifudp() {
+  [ -n "$DATAPLANE_UDP" ]
+}
+function routeAddOrDelete() {
+  local gw dev
+  while read prefix label dst vrf delete; do
+    if ! gw="${VRFSGW[$vrf]}" || [ -z "$gw" ]; then
+      error 2 "failed to get gw for vrf $name"
+    fi
+    case "$delete" in
+      "true")
+        if [ -n "$DATAPLANE_LWTUNNEL" ]; then
+          ifudp && (cmd ip route delete $prefix encap ip id $label src $MY_IP dst $dst proto bgp dev udp table $vrf src $gw metric $DATAPLANE_ROUTE_UDP_METRIC||:)
+          cmd ip route delete $prefix encap ip id $label src $MY_IP dst $dst proto bgp dev gre table $vrf src $gw metric $DATAPLANE_ROUTE_GRE_METRIC||:
+        else
+          if ifudp; then
+            if dev=$(udpCreate $dst); then
+              cmd ip route delete $prefix encap mpls $label dev $dev table $vrf proto bgp src $gw metric $DATAPLANE_ROUTE_UDP_METRIC||:
+            fi
+          fi
+          if dev=$(greCreate $dst); then
+            cmd ip route delete $prefix encap mpls $label dev $dev table $vrf proto bgp src $gw metric $DATAPLANE_ROUTE_GRE_METRIC||:
+          fi
+        fi
+        ;;
+      *) # add
+        if [ -n "$DATAPLANE_LWTUNNEL" ]; then
+          ifudp && (cmd ip route replace $prefix encap ip id $label src $MY_IP dst $dst proto bgp dev udp table $vrf src $gw metric $DATAPLANE_ROUTE_UDP_METRIC||:)
+          cmd ip route replace $prefix encap ip id $label src $MY_IP dst $dst proto bgp dev gre table $vrf src $gw metric $DATAPLANE_ROUTE_GRE_METRIC||:
+        else
+          if ifudp; then
+            if dev=$(udpCreate $dst); then
+              cmd ip route replace $prefix encap mpls $label dev $dev table $vrf proto bgp src $gw metric $DATAPLANE_ROUTE_UDP_METRIC||:
+            fi
+          fi
+          if dev=$(greCreate $dst); then
+            cmd ip route replace $prefix encap mpls $label dev $dev table $vrf proto bgp src $gw metric $DATAPLANE_ROUTE_GRE_METRIC||:
+          fi
+        fi
+        ;;
+    esac
+  done
+}
+
+function routeCreate() {
+  routeListControlplane|routeAddOrDelete
+}
+
+function routeMonitor() {
+  routeMonitorControlplane|routeAddOrDelete
+}
+
+function route_bgp_resolve_vrf() {
+  local vrf del
+  grep --line-buffered -v "^$"|while read a b c rd; do
+    del="$(echo "$rd"|grep -o 'true'||:)"
+    vrf="$(for r in $rd; do echo ${RDVRFS[$r]}; done|grep -v "^$"|sort -u)"
+    if [ $(echo "$vrf"|wc -l) -gt 1 ]; then
+      error 1 "bgp route for $a maps to multiple vrf: $vrf"
+    fi
+    if [ -z "$vrf" ]; then
+      debug "bgp route for $a do not maps to dataplane vrf"
+      continue
+    fi
+    echo $a $b $c $vrf $del
+  done
+}
+
+function routeListControlplane() {
+  if ! (gobgp -j global rib -a vpnv4|
+          jq -r 'to_entries[]|.value[]|[.nlri.prefix,.nlri.labels[0],(.attrs[]|select(.type==14)|.nexthop),(.attrs[]|select(.type==16)|.value[]|select(.type==1 and .subtype==2)|.value)]|@tsv'|
+          route_bgp_resolve_vrf); then
+    error 1 "failed to query or parse gobgp l3vpn routes"
+  fi
+}
+
+function routeMonitorControlplane() {
+  gobgp -j monitor global rib -a vpnv4|
+    jq --unbuffered -r '.[]|[.nlri.prefix,.nlri.labels[0],(.attrs[]|select(.type==14)|.nexthop),(.attrs[]|select(.type==16)|.value[]|select(.type==1 and .subtype==2)|.value), .withdrawal]|@tsv'|
+    route_bgp_resolve_vrf
+}
+
+function routeList(){
+  local filter="${1:-both}" # controlplane dataplane or both
+  case "$filter" in
+    "controlplane")
+      routeListControlplane
+      ;;
+    "dataplane")
+      routeListDataplane
+      ;;
+    "both")
+      routeListControlplane
+      routeListDataplane
+      ;;
+    *)
+      error 1 "filter is controlplane dataplane or both, but got $filter"
+      ;;
+  esac
+}
+
+function tunnelApplySysctl() {
+  local name="$1"
+  echo "$TUNNEL_PROC_SETTINGS"|grep -v "^$"|(export name; envsubst)|while read value file; do
+    echo $value > $file
+  done
+}
+
+function get_route_src_and_dev() {
+  local ip="$1"
+  local R D L
+  if R="$(ip -o r g $ip)" && [ -n "$R" ]; then
+    if D="$(echo $R|sed "s/.* dev \([^[:blank:]]\+\).*/\1/")" && [ -n "$D" ]; then #"
+      if L="$(echo $R|sed "s/.* src \([^[:blank:]]\+\).*/\1/")" && [ -n "$L" ]; then #"
+        echo $L $D
+      else
+        debug "failed to get src form route"
+        return 1
+      fi
+    else
+      debug "failed to get dev form route"
+      return 2
+    fi
+  else
+    debug "failed to get route or no route to $ip"
+    return 3
+  fi
+}
+
+function tundevCreate() {
+  local type="$1"
+  local remote="$2"
+  local name="$type-$remote"
+  local R
+  if ! ip link show "$name" >/dev/null 2>&1; then
+    get_route_src_and_dev $remote|while read src dev; do
+      case "$type" in
+        "udp")
+          R="$(ip fou show 2>/dev/null||:)"
+          if [ -z "$R" ]; then
+            cmd ip fou add port 6635 ipproto 137
+          fi
+          cmd ip link add name "$name" type ipip mode mplsip local $src remote $remote ttl 64 encap fou encap-sport auto encap-dport 6635 dev $dev
+          ;;
+        "gre")
+          cmd ip tunnel add $name mode gre local $src remote $remote ttl 64 dev $dev
+          ;;
+        *)
+          error 1 "unknown tunnel device type: $type"
+          ;;
+      esac
+      cmd ip link set "$name" up
+      tunnelApplySysctl "$name"
+    done
+  fi
+  echo "$name"
+}
+
+function tundevList() {
+  local type="$1"
+  ip -j l sh type "$type" | jq -r '.[]|select(.broadcast != "0.0.0.0" and .broadcast != "00:00:00:00")|[.ifname,.broadcast]|@tsv'|tr '\t' ' '|sort
+}
+
+function tundevDelete() {
+  local type="$1"
+  tundevList "$type"| while read name remote; do
+      cmd ip link delete $name
+  done
+}
+
+function udpCreate() {
+  local remote="$1"
+  tundevCreate udp "$remote"
+}
+
+function udpList() {
+  tundevList ipip
+}
+
+function udpDelete() {
+  tundevDelete ipip
+}
+
+function greCreate() {
+  local remote="$1"
+  tundevCreate gre "$remote"
+}
+
+function greList() {
+  tundevList gre
+}
+
+function greDelete() {
+  tundevDelete gre
+}
+
+function mudpList() {
+  local name="udp"
+  ip -d -o l sh dev "$name"
+}
+
+function mudpCreate() {
+  local name="udp"
+  cmd ip fou add port 6635 ipproto 137
+  cmd ip link add name "$name" type ipip mode mplsip local $MY_IP ttl 64 encap fou encap-sport auto encap-dport 6635 dev eth0
+  cmd ip link set "$name" up
+  tunnelApplySysctl "$name"
+
+  cmd tc qdisc add dev "$name" root handle 1: prio priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  for n in `seq 15 150`; do
+    cmd tc filter add dev "$name" protocol ip parent 1: flower enc_key_id $n action mpls push protocol mpls_uc label $n ttl 64 pass
+  done
+}
+
+function mudpDelete() {
+  local name="udp"
+  local R
+  if ip link show "$name" 2>/dev/null; then
+    cmd ip link delete "$name"
+  fi
+  if R=$(ip fou show 2>/dev/null) && [ -n "$R" ]; then
+    cmd ip fou del port 6635
+  fi
+}
+
+function mgreList() {
+  ip -d -o l sh dev gre
+}
+
+function mgreCreate() {
+  local input="gre-in"
+  local output="gre"
+  local n
+
+  cmd ip tunnel add "$input" mode gre local $MY_IP ttl 64 dev eth0||:
+  cmd ip link set "$input" up
+  tunnelApplySysctl "$input"
+
+  cmd ip link add name "$output" type gre external
+  cmd ip link set "$output" up
+  cmd tc qdisc add dev "$output" root handle 1: prio priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  for n in `seq 15 150`; do
+    cmd tc filter add dev "$output" protocol ip parent 1: flower enc_key_id $n action mpls push protocol mpls_uc label $n ttl 64 pass
+  done
+}
+
+function mgreDelete() {
+  local input="gre-in"
+  local output="gre"
+  if ip link show "$input" 2>/dev/null; then
+    cmd ip link delete "$input"
+  fi
+  if ip link show "$output" 2>/dev/null; then
+    cmd ip link delete "$output"
+  fi
+}
+
+function tunnelList() {
+  if [ -n "$DATAPLANE_LWTUNNEL" ]; then
+    mgreList
+    ifudp && mudpList
+  else
+    greList
+    ifudp && udpList
+  fi
+}
+
+function tunnelCreate() {
+  if [ -n "$DATAPLANE_LWTUNNEL" ]; then
+    mgreCreate
+    ifudp && mudpCreate
+  fi
+}
+
+function tunnelDelete() {
+  if [ -n "$DATAPLANE_LWTUNNEL" ]; then
+    mgreDelete
+    ifudp && mudpDelete
+  else
+    greDelete
+    ifudp && udpDelete
+  fi
+}
+
+function check_pre_reqs() {
+  local out
+  if ! which jq >/dev/null; then
+    error 1 "jq not found. Please install"
+  fi
+  if ! which ip >/dev/null; then
+    error 1 "ip not found. Please install"
+  fi
+  if ! which ipcalc >/dev/null; then
+    error 1 "ipcalc not found. Please install"
+  fi
+  if out="$(ip -o r g "$BGP_PEER_IP")"; then
+    if ! MY_IP="$(echo "$out"|awk '/src/ {f=NR} f&&NR-1==f' RS=' ')"; then
+      error 1 "failed to get local IP"
+    fi
+  fi
+
+}
+
+function gobgpd_conf_gen() {
+  local out
+  echo "$GOBGPD_CONF_TEMPLATE"|(
+    export MY_IP BGP_PEER_IP;
+    envsubst
+    )
+}
+
+function gobgpdWriteConf() {
+  mkdir -p /etc/gobgp
+  gobgpd_conf_gen | tee /etc/gobgp/gobgpd.conf
+}
+
+function gobgpdWriteService() {
+  echo "$GOBGPD_SERVICE"|tee /etc/systemd/system/gobgpd.service
+}
+
+function sgwWriteService() {
+  echo "$SGW_SERVICE"|tee /etc/systemd/system/sgw.service
+}
+
+function controlplaneCreate() {
+  if ! [ -f /usr/local/bin/gobgpd -a -f /usr/local/bin/gobgp ]; then
+    curl -s -L https://github.com/osrg/gobgp/releases/download/v2.15.0/gobgp_2.15.0_linux_amd64.tar.gz|
+      tar zxv -C /usr/local/bin/ gobgp gobgpd
+  fi
+  [ -f /etc/gobgp/gobgpd.conf ] || gobgpdWriteConf
+  [ -f /etc/systemd/system/gobgpd.service ] || gobgpdWriteService
+  systemctl start gobgpd.service
+  [ -f /etc/systemd/system/sgw.service ] || sgwWriteService
+  systemctl start sgw.service
+}
+
+function controlplaneDelete() {
+  if ! systemctl stop sgw.service; then
+    msg "failed to stop sgw"
+  fi
+  if ! systemctl stop gobgpd.service; then
+    msg "failed to stop gobgpd"
+  fi
+  [ -f /etc/systemd/system/gobgpd.service ] && rm -f /etc/systemd/system/gobgpd.service
+  [ -f /etc/gobgp/gobgpd.conf ] && rm -f /etc/gobgp/gobgpd.conf
+  [ -f /etc/systemd/system/sgw.service ] && rm -f /etc/systemd/system/sgw.service
+}
+
+function controlplaneStatus() {
+  echo -n "gobgpd.conf "; [ -f /etc/gobgp/gobgpd.conf ] && echo OK || echo Missing
+  echo -n "gobgpd.service "; [ -f /etc/systemd/system/gobgpd.service ] && echo OK || echo Missing
+  echo -n "sgw.service "; [ -f /etc/systemd/system/sgw.service ] && echo OK || echo Missing
+  systemctl --no-pager status gobgpd.service ||:
+  systemctl --no-pager status sgw.service ||:
+  cmd gobgp neighbor $BGP_PEER_IP ||:
+  cmd gobgp n $BGP_PEER_IP adj-in -a rtc ||:
+  cmd gobgp n $BGP_PEER_IP adj-out -a rtc ||:
+  cmd gobgp n $BGP_PEER_IP adj-in -a evpn ||:
+  cmd gobgp n $BGP_PEER_IP adj-out -a evpn ||:
+  cmd gobgp n $BGP_PEER_IP adj-in -a vpnv4 ||:
+  cmd gobgp n $BGP_PEER_IP adj-out -a vpnv4 ||:
+}
+
+function dataplaneCreate() {
+  local M="$MODULES"
+  echo "$SYSCTL" | tee "$SYSCTL_FILE"
+  sysctl -p "$SYSCTL_FILE"
+  if ! ifudp; then
+    M="$(echo "$M"|grep -v "^fou$")"
+  fi
+  echo "$M" | tee "$MODULES_FILE"
+  for mod in $M; do
+    cmd modprobe $mod
+  done
+}
+
+function dataplaneDelete() {
+  [ -f "$SYSCTL_FILE" ] && rm -f "$SYSCTL_FILE"
+  [ -f "$MODULES_FILE" ] && rm -f "$MODULES_FILE"
+}
+
+function dataplaneStatus() {
+  local M="$MODULES"
+  [ -f "$SYSCTL_FILE" ] && cat "$SYSCTL_FILE"
+  [ -f "$MODULES_FILE" ] && cat "$MODULES_FILE"
+  for s in $(echo "$SYSCTL"|awk -F= '{print $1}'); do
+    sysctl $s
+  done
+  if ! ifudp; then
+    M="$(echo "$M"|grep -v "^fou$")"
+  fi
+  for mod in $M; do
+    lsmod|grep "^$mod"
+  done
+}
+
+function Create(){
+  local filter="${1:-both}" # controlplane dataplane or both
+  case "$filter" in
+    "controlplane")
+      controlplaneCreate
+      ;;
+    "dataplane")
+      dataplaneCreate
+      tunnelCreate
+      ;;
+    "both")
+      controlplaneCreate
+      dataplaneCreate
+      tunnelCreate
+      ;;
+    *)
+      error 1 "filter is controlplane dataplane or both, but got $filter"
+      ;;
+  esac
+  local vrf
+  for vrf in $(echo "${!VRFS[@]}"|tr ' ' '\n'|sort -u); do
+    vrfCreate $vrf $filter
+  done
+}
+
+function Init(){
+  local vrf
+  dataplaneCreate
+  tunnelCreate
+  for vrf in $(echo "${!VRFS[@]}"|tr ' ' '\n'|sort -u); do
+    vrfCreate $vrf
+  done
+}
+
+function Status(){
+  local filter="${1:-both}" # controlplane dataplane or both
+  case "$filter" in
+    "controlplane")
+      controlplaneStatus
+      ;;
+    "dataplane")
+      dataplaneStatus
+      ;;
+    "both")
+      controlplaneStatus
+      dataplaneStatus
+      ;;
+    *)
+      error 1 "filter is controlplane dataplane or both, but got $filter"
+      ;;
+  esac
+  vrfList $filter
+}
+
+function Delete(){
+  local filter="${1:-both}" # controlplane dataplane or both
+  local vrf
+  for vrf in $(vrfList "$filter"|awk '{print $1}'|sort -u); do
+    vrfDelete $vrf $filter
+  done
+  case "$filter" in
+    "controlplane")
+      controlplaneDelete
+      ;;
+    "dataplane")
+      tunnelDelete
+      dataplaneDelete
+      ;;
+    "both")
+      controlplaneDelete
+      tunnelDelete
+      dataplaneDelete
+      ;;
+    *)
+      error 1 "filter is controlplane dataplane or both, but got $filter"
+      ;;
+  esac
+}
+
+function menu() {
+  PS3='Scope (or Ctrl+D): '
+  select scope in controlplane dataplane both; do
+    action_list="Create Status Delete vrfList vrfCreate vrfDelete routeCreate routeList routeMonitor"
+    case $scope in
+      "dataplane")
+        action_list="udpCreate udpDelete tunnelCreate tunnelDelete tunnelList $action_list"
+      ;;
+      "controlplane")
+        action_list="$action_list"
+      ;;
+      *)
+      ;;
+    esac
+    PS3="$scope Action (or Ctrl+D): "
+    select action in $action_list; do
+      case $action in
+      "vrfDelete")
+        all="$(vrfList $scope|awk '{print $1}'|sort -u)"
+        ;;&
+      "vrfCreate")
+        all="$(echo "${!VRFS[@]}"|tr ' ' '\n'|sort -u)"
+        ;;&
+      "vrfCreate"|"vrfDelete")
+        PS3="$scope/$action VRF (or Ctrl+D): "
+        select vrf_keys in $all all; do
+          if [ "$vrf_keys" == "all" ]; then
+            vrf_keys="$all"
+          fi
+          for vrf in $vrf_keys; do
+            $action $vrf $scope
+          done
+        done
+        PS3="$scope Action (or Ctrl+D): "
+        ;;
+      "routeList"|"vrfList"|"Create"|"Delete"|"Status")
+        $action $scope
+        ;;
+      *)
+        $action
+        ;;
+      esac
+      echo
+    done
+    PS3='Scope (or Ctrl+D): '
+  done
+}
+
+usage() {
+    if [ -z "$1" ]; then
+    echo
+    echo "Usage: $PROG [[-m|--monitor]|[-s|--status]|[-l|--list]] [-t||--lwtunnel] [-q|--quiet] [-d|--debug] [-h|--help]" >&2
+    (
+    echo
+    echo "Examples:"
+    echo
+    echo " To monitor and appy routes:"
+    echo "  $PROG --monitor"
+    echo
+    echo " To list currently installed routes in controlplane and dataplane:"
+    echo "  $PROG --list"
+    echo
+    ) >&2
+    else
+    ( echo; echo "Error: $1"; echo ) >&2
+    fi
+
+    exit 1
+}
+
+PROG="${PROG:-${0##*/}}"
+check_pre_reqs
+
+TEMP=`getopt -n "$PROG" -o "hdqtlsm" -l "help,debug,quiet,dryrun,lwtunnel,list,status,monitor,create,init,delete" -- "$@"` || usage ""
+eval set -- "$TEMP"
+
+action=
+scope=
+vrf=
+
+debug=
+verbose=1
+dryrun=
+lwtunnel=
+list=
+status=
+monitor=
+create=
+delete=
+init=
+
+while :; do
+    case "$1" in
+    -h|--help)
+        usage ""
+        ;;
+    -d|--debug)
+        debug=1
+        info=1
+        ;;
+    -q|--quiet)
+        verbose=
+        ;;
+    --dryrun)
+        dryrun=1
+        ;;
+    -t|--lwtunnel)
+        DATAPLANE_LWTUNNEL=yes
+        ;;
+    -l|--list)
+        list=1
+        ;;
+    -s|--status)
+        status=1
+        ;;
+    --create)
+        create=1
+        ;;
+    --init)
+        init=1
+        ;;
+    --delete)
+        delete=1
+        ;;
+    -m|--monitor)
+        monitor=1
+        ;;
+    --)
+        shift
+        break
+        ;;
+    esac
+    shift
+done
+
+if [ -n "$monitor" ]; then
+  routeMonitor
+elif [ -n "$list" ]; then
+  routeList
+elif [ -n "$status" ]; then
+  Status
+elif [ -n "$create" ]; then
+  Create
+elif [ -n "$init" ]; then
+  Init
+elif [ -n "$delete" ]; then
+  Delete
+else
+  menu
+fi
