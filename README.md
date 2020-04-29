@@ -18,7 +18,7 @@ There is no support for udp tunneling in stock CentOS 8 kernel, so disable it:
 
     touch /root/noudp
 
-If you want static tunnels to be configured insted of lightweight route-based tunnels:
+If you want static tunnels to be configured instead of lightweight route-based tunnels:
 
     touch /root/nolwtun
 
