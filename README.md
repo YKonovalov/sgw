@@ -11,10 +11,15 @@ Known to work on Centos 8 and Fedora 32, but other distros should be ok too. You
 configuring
 ===========
 There is no configuration file. Look at the top of the script and tune vrfs and bgp peer vars. You may also set your bgp peer in file:
+
     echo "192.168.0.2" > /root/bgpneigh
+
 There is no support for udp tunneling in stock CentOS 8 kernel, so disable it:
+
     touch /root/noudp
+
 If you want static tunnels to be configured insted of lightweight route-based tunnels:
+
     touch /root/nolwtun
 
 use
