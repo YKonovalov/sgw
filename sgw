@@ -706,7 +706,7 @@ function routeAddOrDelete() {
     done)
   }
   function pathAdd(){
-    ip -j route sh $prefix table $vrf proto bgp metric $metric|
+    ip -$afi -j route sh $prefix table $vrf proto bgp metric $metric|
       jq -r --argjson p \[\"$encap\",\"$dst\",$label\] \
       '.[]|[(.nexthops[]? // .|[.dev, .dst,.id])]
        |if contains([$p]) then
@@ -721,7 +721,7 @@ function routeAddOrDelete() {
         end'|pathFormat||:
   }
   function pathDelete(){
-    ip -j route sh $prefix table $vrf proto bgp metric $metric|
+    ip -$afi -j route sh $prefix table $vrf proto bgp metric $metric|
       jq -r --argjson p \[\"$encap\",\"$dst\",$label\] \
       '.[]|[(.nexthops[]? // .|[.dev, .dst,.id])]
        |if contains([$p]) then
@@ -736,7 +736,7 @@ function routeAddOrDelete() {
         end'|pathFormat||:
   }
   function pathDeleteStaleMetric(){
-    ip -j route sh $prefix table $vrf proto bgp|
+    ip -$afi -j route sh $prefix table $vrf proto bgp|
       jq -r --argjson p \[\"$encap\",\"$dst\",$label\] \
       '.[]|select(.metric!='$metric')|.metric as $m
        |[(.nexthops[]? // .|[.dev, .dst,.id])]
