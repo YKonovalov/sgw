@@ -81,7 +81,7 @@ JQ_VPN_ROUTE='
 [
   ([.attrs[]|select(.type==16)|.value[]|select((.type|IN(0,1,2)) and .subtype==2)|.value|tostring|$vrf[.]? // empty]|unique|join(",")),
   .nlri.prefix,
-  ((.attrs[]|select(.type==4)|.metric) // 300|.+$encapprio[$e]),
+  ((.attrs[]|select(.type==4)|.metric) // 300|.+($encapprio[$e]? // 10)),
   $e,
   (.attrs[]|select(.type==14)|.nexthop),
   .nlri.labels[0],
@@ -1303,6 +1303,10 @@ $AFIS
     - config:
         neighbor-address: $ip
         peer-group: $group
+      ebgp-multihop:
+        config:
+          enabled: true
+          multihop-ttl: 5
 '
   local VRF_TEMP='
     - config:
