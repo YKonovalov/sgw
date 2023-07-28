@@ -674,7 +674,7 @@ function routeListDataplane() {
   msg "===== routeListDataplane:"
   if iflwtunnel; then
     ip -j route show table all proto bgp|sed 's/{"dst"/{"dstp"/g'|
-      jq -r '.[]|[.table,(.dstp|if(contains("/")) then . elif(contains(":")) then .+"/128" else .+"/32" end),.metric]+(.nexthops[]? // .|[.dev, .dst,.id])|@tsv'
+      jq -r '.[]|select( (.dstp|contains(".")) or (.dstp|contains(":")) )|[.table,(.dstp|if(contains("/")) then . elif(contains(":")) then .+"/128" else .+"/32" end),.metric]+(.nexthops[]? // .|[.dev, .dst,.id])|@tsv'
   else
     ip route show table all proto bgp|
       while read prefix encap mpls label dev dev table table src src metric metric o; do
@@ -1343,7 +1343,7 @@ function sgwWriteService() {
 }
 
 function gobgpdInstall() {
-  local gobgp_url=https://github.com/osrg/gobgp/releases/download/v3.10.0/gobgp_3.10.0_linux_amd64.tar.gz
+  local gobgp_url=https://github.com/osrg/gobgp/releases/download/v3.16.0/gobgp_3.16.0_linux_amd64.tar.gz
   local gobgp_tarball="$(basename $gobgp_url)"
   [ -f "$gobgp_tarball" ] || \
     curl -O -L "$gobgp_url"
